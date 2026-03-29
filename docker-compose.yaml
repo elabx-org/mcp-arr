@@ -1,0 +1,25 @@
+services:
+  mcp-arr:
+    build: .
+    container_name: mcp-arr
+    ports:
+      - "8000:8000"
+    environment:
+      - ARR_SONARR_URL=${ARR_SONARR_URL}
+      - ARR_SONARR_KEY=${ARR_SONARR_KEY}
+      - ARR_SONARRANI_URL=${ARR_SONARRANI_URL}
+      - ARR_SONARRANI_KEY=${ARR_SONARRANI_KEY}
+      - ARR_SONARR4K_URL=${ARR_SONARR4K_URL}
+      - ARR_SONARR4K_KEY=${ARR_SONARR4K_KEY}
+      - ARR_RADARR_URL=${ARR_RADARR_URL}
+      - ARR_RADARR_KEY=${ARR_RADARR_KEY}
+      - ARR_RADARR4K_URL=${ARR_RADARR4K_URL}
+      - ARR_RADARR4K_KEY=${ARR_RADARR4K_KEY}
+      - MCP_TRANSPORT=${MCP_TRANSPORT:-sse}
+      - MCP_PORT=${MCP_PORT:-8000}
+    networks:
+      - zurg-net
+
+networks:
+  zurg-net:
+    external: true
