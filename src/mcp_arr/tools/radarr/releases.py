@@ -16,7 +16,7 @@ async def radarr_search_movie_releases(movie_id: int, instance: str | None = Non
             the first configured radarr instance.
     """
     client = resolve_instance(instance, "radarr")
-    result = await client.get("/api/v3/release", params={"movieId": movie_id})
+    result = await client.search_get("/api/v3/release", params={"movieId": movie_id})
     releases = result if isinstance(result, list) else []
     return {
         "releases": releases,

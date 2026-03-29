@@ -1,11 +1,17 @@
 """Sonarr/Radarr API HTTP client."""
 
 import logging
+import os
 from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Release searches query live indexers and can take 60-120s.
+# Override with ARR_SEARCH_TIMEOUT env var (seconds).
+_DEFAULT_TIMEOUT = float(os.environ.get("ARR_TIMEOUT", "30"))
+_SEARCH_TIMEOUT = float(os.environ.get("ARR_SEARCH_TIMEOUT", "120"))
 
 
 class ArrError(Exception):
@@ -37,7 +43,8 @@ class ArrClient:
             "X-Api-Key": api_key,
             "Content-Type": "application/json",
         }
-        self.timeout = httpx.Timeout(30.0, connect=10.0)
+        self.timeout = httpx.Timeout(_DEFAULT_TIMEOUT, connect=10.0)
+        self.search_timeout = httpx.Timeout(_SEARCH_TIMEOUT, connect=10.0)
 
     async def _request(
         self,
@@ -45,6 +52,7 @@ class ArrClient:
         path: str,
         params: dict | None = None,
         data: dict | None = None,
+        timeout: httpx.Timeout | None = None,
     ) -> Any:
         """Make an HTTP request to the arr API.
 
@@ -63,7 +71,7 @@ class ArrClient:
         url = f"{self.url}{path}"
         logger.debug("%s %s %s", method, url, params or data)
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout or self.timeout) as client:
             response = await client.request(
                 method=method,
                 url=url,
@@ -112,6 +120,13 @@ class ArrClient:
             result = response.json()
             logger.debug("Response: %s", result)
             return result
+
+    async def search_get(self, path: str, params: dict | None = None) -> Any:
+        """GET with the extended search timeout (default 120s).
+
+        Use for /api/v3/release endpoints that query live indexers.
+        """
+        return await self._request("GET", path, params=params, timeout=self.search_timeout)
 
     async def get(self, path: str, params: dict | None = None) -> Any:
         """Make a GET request.

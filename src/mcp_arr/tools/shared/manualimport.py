@@ -46,3 +46,83 @@ async def arr_update_manual_import(
     client = resolve_instance(instance, "sonarr")
     result = await client.put("/api/v3/manualimport", data=files)
     return result if isinstance(result, dict) else {"success": True, "files_processed": len(files)}
+
+
+@mcp.tool()
+async def arr_force_import_download(
+    download_id: str,
+    instance: str | None = None,
+    import_mode: str = "Move",
+) -> dict:
+    """Force import a completed download, replacing any existing file at the same quality.
+
+    Use this for Option B replacements — when you've grabbed a new release but Sonarr
+    would normally reject the import because a file at the same quality already exists
+    (e.g., replacing a torrent Remux with a usenet Remux from a better release group).
+
+    Workflow:
+    1. Use arr_grab_release to grab the new release — it downloads via usenet/torrent.
+    2. Wait for the download to complete (check activity queue with arr_get_queue).
+    3. Call this tool with the download_id from the queue item to force the import,
+       bypassing Sonarr's "already have this quality" rejection.
+
+    Args:
+        download_id: Download client task ID — get this from arr_get_queue after the
+            download completes. It's the "downloadId" field on the queue item.
+        import_mode: "Move" (default) or "Copy". Move removes the source file after
+            import; Copy keeps it in the download client's folder.
+        instance: Instance name (e.g., "sonarr", "radarr"). Uses default if not specified.
+
+    Returns:
+        Command result with status. The import runs asynchronously — check Sonarr's
+        Activity > Queue to confirm the file was replaced.
+    """
+    client = resolve_instance(instance, "sonarr")
+
+    # Step 1: Get the importable files for this download, ignoring existing file filter
+    files = await client.get(
+        "/api/v3/manualimport",
+        params={"downloadId": download_id, "filterExistingFiles": False},
+    )
+    if not files:
+        return {
+            "success": False,
+            "download_id": download_id,
+            "error": "No importable files found for this download ID. "
+                     "Check that the download is complete and the ID is correct.",
+        }
+
+    # Step 2: Issue the ManualImport command with replaceExistingFiles=True
+    import_files = []
+    for f in files:
+        entry: dict = {
+            "path": f.get("path"),
+            "importMode": import_mode,
+            "releaseGroup": f.get("releaseGroup", ""),
+            "quality": f.get("quality"),
+        }
+        # Sonarr fields
+        if "seriesId" in f:
+            entry["seriesId"] = f["seriesId"]
+            entry["episodeIds"] = [e["id"] for e in f.get("episodes", [])]
+            entry["seasonNumber"] = f.get("seasonNumber")
+        # Radarr fields
+        if "movieId" in f:
+            entry["movieId"] = f["movieId"]
+        import_files.append(entry)
+
+    command = {
+        "name": "ManualImport",
+        "files": import_files,
+        "importMode": import_mode,
+        "replaceExistingFiles": True,
+    }
+    result = await client.post("/api/v3/command", data=command)
+
+    return {
+        "success": True,
+        "download_id": download_id,
+        "files_queued": len(import_files),
+        "files": [f.get("path") for f in import_files],
+        "command": result,
+    }

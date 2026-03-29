@@ -26,7 +26,7 @@ async def sonarr_search_season_releases(
     """
     client = resolve_instance(instance, "sonarr")
     params = {"seriesId": series_id, "seasonNumber": season_number}
-    result = await client.get("/api/v3/release", params=params)
+    result = await client.search_get("/api/v3/release", params=params)
     releases = result if isinstance(result, list) else []
     return {
         "releases": releases,
@@ -49,7 +49,7 @@ async def sonarr_search_episode_releases(
             the first configured sonarr instance.
     """
     client = resolve_instance(instance, "sonarr")
-    result = await client.get("/api/v3/release", params={"episodeId": episode_id})
+    result = await client.search_get("/api/v3/release", params={"episodeId": episode_id})
     releases = result if isinstance(result, list) else []
     return {
         "releases": releases,
