@@ -1,5 +1,6 @@
 """Sonarr/Radarr API HTTP client."""
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -12,6 +13,11 @@ logger = logging.getLogger(__name__)
 # Override with ARR_SEARCH_TIMEOUT env var (seconds).
 _DEFAULT_TIMEOUT = float(os.environ.get("ARR_TIMEOUT", "30"))
 _SEARCH_TIMEOUT = float(os.environ.get("ARR_SEARCH_TIMEOUT", "120"))
+
+# Minimum delay between requests to the same instance (seconds).
+# Prevents API hammering when making many sequential calls.
+# Override with ARR_REQUEST_DELAY env var (e.g. "0.5").
+_REQUEST_DELAY = float(os.environ.get("ARR_REQUEST_DELAY", "0.25"))
 
 
 class ArrError(Exception):
@@ -45,6 +51,7 @@ class ArrClient:
         }
         self.timeout = httpx.Timeout(_DEFAULT_TIMEOUT, connect=10.0)
         self.search_timeout = httpx.Timeout(_SEARCH_TIMEOUT, connect=10.0)
+        self._last_request: float = 0.0
 
     async def _request(
         self,
@@ -68,6 +75,14 @@ class ArrClient:
         Raises:
             ArrError: If the request fails
         """
+        # Rate limiting: enforce minimum delay between requests per instance
+        if _REQUEST_DELAY > 0:
+            import time
+            elapsed = time.monotonic() - self._last_request
+            if elapsed < _REQUEST_DELAY:
+                await asyncio.sleep(_REQUEST_DELAY - elapsed)
+            self._last_request = time.monotonic()
+
         url = f"{self.url}{path}"
         logger.debug("%s %s %s", method, url, params or data)
 

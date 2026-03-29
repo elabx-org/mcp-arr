@@ -34,18 +34,21 @@ async def arr_update_manual_import(
     files: list[dict],
     instance: str | None = None,
 ) -> dict:
-    """Update manual import file mappings and trigger the import.
+    """Reprocess/validate manual import file mappings (does not trigger import).
+
+    Sends updated file mappings to Sonarr/Radarr for re-evaluation and returns
+    the files with updated rejection status. Use this to verify mappings before
+    triggering the actual import via arr_force_import_download.
 
     Args:
-        files: List of file import dicts. Each dict should contain the fields
-            returned by arr_get_manual_import, updated with correct series/episode/movie
-            IDs and quality information. At minimum: path, seriesId/movieId, quality.
+        files: List of file import dicts with updated series/episode/movie ID
+            mappings. Use the structure returned by arr_get_manual_import.
         instance: Instance name (e.g., "sonarr", "radarr"). When None, uses the
             first configured sonarr instance.
     """
     client = resolve_instance(instance, "sonarr")
-    result = await client.put("/api/v3/manualimport", data=files)
-    return result if isinstance(result, dict) else {"success": True, "files_processed": len(files)}
+    result = await client.post("/api/v3/manualimport", data=files)
+    return {"files": result if isinstance(result, list) else [], "reprocessed": len(files)}
 
 
 @mcp.tool()
@@ -53,33 +56,44 @@ async def arr_force_import_download(
     download_id: str,
     instance: str | None = None,
     import_mode: str = "Move",
+    strategy: str = "force",
 ) -> dict:
-    """Force import a completed download, replacing any existing file at the same quality.
+    """Handle completed downloads blocked by Sonarr/Radarr's upgrade check.
 
-    Use this for Option B replacements — when you've grabbed a new release but Sonarr
-    would normally reject the import because a file at the same quality already exists
-    (e.g., replacing a torrent Remux with a usenet Remux from a better release group).
+    When a download completes but sits in importPending because Sonarr/Radarr
+    rejects it as "not an upgrade", use this tool to push it through.
 
-    Workflow:
-    1. Use arr_grab_release to grab the new release — it downloads via usenet/torrent.
-    2. Wait for the download to complete (check activity queue with arr_get_queue).
-    3. Call this tool with the download_id from the queue item to force the import,
-       bypassing Sonarr's "already have this quality" rejection.
+    Three strategies:
+
+    **force** (Option B — default): Issue a ManualImport command with
+    replaceExistingFiles=True. The new file atomically replaces the existing one.
+    Best when you want an immediate swap with no gap in availability.
+
+    **delete_existing** (Option A.1): Delete the existing episode/movie files first,
+    then return. Sonarr/Radarr will auto-import on its next queue check cycle since
+    the episode now has no file. Best when you prefer Sonarr to handle import
+    naturally without a force command.
+
+    Workflow for both strategies:
+    1. Use arr_grab_release to grab the new release.
+    2. Wait for it to complete (arr_get_queue shows status="completed",
+       trackedDownloadState="importPending").
+    3. Call this tool with the downloadId from the queue item.
 
     Args:
-        download_id: Download client task ID — get this from arr_get_queue after the
-            download completes. It's the "downloadId" field on the queue item.
-        import_mode: "Move" (default) or "Copy". Move removes the source file after
-            import; Copy keeps it in the download client's folder.
+        download_id: Download client task ID from arr_get_queue ("downloadId" field).
+        import_mode: "Move" (default) or "Copy". Move deletes source after import.
+            Only applies to strategy="force".
+        strategy: "force" (default) or "delete_existing".
         instance: Instance name (e.g., "sonarr", "radarr"). Uses default if not specified.
 
     Returns:
-        Command result with status. The import runs asynchronously — check Sonarr's
-        Activity > Queue to confirm the file was replaced.
+        For strategy="force": command result — check arr_get_queue to confirm import.
+        For strategy="delete_existing": list of deleted file IDs — Sonarr auto-imports.
     """
     client = resolve_instance(instance, "sonarr")
 
-    # Step 1: Get the importable files for this download, ignoring existing file filter
+    # Step 1: Get importable files, bypassing existing-file filter
     files = await client.get(
         "/api/v3/manualimport",
         params={"downloadId": download_id, "filterExistingFiles": False},
@@ -92,8 +106,7 @@ async def arr_force_import_download(
                      "Check that the download is complete and the ID is correct.",
         }
 
-    # Step 2: Check rejections — skip any file blocked for sample-related reasons.
-    # We only want to bypass quality-upgrade rejections, not legitimate content warnings.
+    # Step 2: Skip files with sample-related rejections — only bypass upgrade rejections.
     _SAMPLE_PHRASES = [
         "sample",
         "unable to determine if file is a sample",
@@ -115,22 +128,7 @@ async def arr_force_import_download(
                 "rejection_messages": sample_rejections,
             })
             continue
-
-        entry: dict = {
-            "path": f.get("path"),
-            "importMode": import_mode,
-            "releaseGroup": f.get("releaseGroup", ""),
-            "quality": f.get("quality"),
-        }
-        # Sonarr fields
-        if "seriesId" in f:
-            entry["seriesId"] = f["seriesId"]
-            entry["episodeIds"] = [e["id"] for e in f.get("episodes", [])]
-            entry["seasonNumber"] = f.get("seasonNumber")
-        # Radarr fields
-        if "movieId" in f:
-            entry["movieId"] = f["movieId"]
-        import_files.append(entry)
+        import_files.append(f)
 
     if skipped and not import_files:
         return {
@@ -140,11 +138,61 @@ async def arr_force_import_download(
             "skipped": skipped,
         }
 
+    # --- Strategy: delete_existing (Option A.1) ---
+    if strategy == "delete_existing":
+        deleted = []
+        for f in import_files:
+            # Sonarr: delete existing episode files referenced in the mapped episodes
+            for ep in f.get("episodes", []):
+                file_id = ep.get("episodeFileId")
+                if file_id:
+                    await client.delete(f"/api/v3/episodefile/{file_id}")
+                    deleted.append({"episodeFileId": file_id})
+            # Radarr: delete existing movie file
+            movie = f.get("movie") or {}
+            movie_file_id = f.get("movieFileId") or movie.get("movieFileId")
+            if movie_file_id:
+                await client.delete(f"/api/v3/moviefile/{movie_file_id}")
+                deleted.append({"movieFileId": movie_file_id})
+        return {
+            "success": True,
+            "strategy": "delete_existing",
+            "download_id": download_id,
+            "deleted_files": deleted,
+            "skipped_sample": skipped,
+            "note": "Existing files deleted. Sonarr/Radarr will auto-import on next queue check.",
+        }
+
+    # --- Strategy: force (Option B) ---
+    command_files = []
+    for f in import_files:
+        entry: dict = {
+            "path": f.get("path"),
+            "importMode": import_mode,
+            "releaseGroup": f.get("releaseGroup", ""),
+            "quality": f.get("quality"),
+            "languages": f.get("languages", []),
+            "downloadId": f.get("downloadId", ""),
+            "indexerFlags": f.get("indexerFlags", 0),
+            "releaseType": f.get("releaseType", "unknown"),
+        }
+        # Sonarr fields — seriesId may be top-level or nested under "series"
+        series_id = f.get("seriesId") or (f.get("series") or {}).get("id", 0)
+        if series_id:
+            entry["seriesId"] = series_id
+            entry["episodeIds"] = [e["id"] for e in f.get("episodes", [])]
+            entry["seasonNumber"] = f.get("seasonNumber")
+        # Radarr fields — movieId may be top-level or nested under "movie"
+        movie_id = f.get("movieId") or (f.get("movie") or {}).get("id", 0)
+        if movie_id:
+            entry["movieId"] = movie_id
+        command_files.append(entry)
+
     result = None
-    if import_files:
+    if command_files:
         command = {
             "name": "ManualImport",
-            "files": import_files,
+            "files": command_files,
             "importMode": import_mode,
             "replaceExistingFiles": True,
         }
@@ -152,8 +200,9 @@ async def arr_force_import_download(
 
     return {
         "success": True,
+        "strategy": "force",
         "download_id": download_id,
-        "files_queued": len(import_files),
+        "files_queued": len(command_files),
         "files": [f.get("path") for f in import_files],
         "skipped_sample": skipped,
         "command": result,
