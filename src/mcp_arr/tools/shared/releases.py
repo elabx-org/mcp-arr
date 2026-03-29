@@ -72,11 +72,11 @@ async def arr_plan_grab(
     (usenet over torrent by default), and optionally distributes episode grabs
     round-robin across available indexers to balance load.
 
-    Fallback chains are ordered so that a different indexer is tried before another
-    copy from the same indexer — because if one NZB on an indexer returns NNTP 451
-    (article expired), all other NZBs for the same release on that indexer will too.
-    Within each indexer tier, releases are sorted youngest-first (smallest age value)
-    since newer binary articles are more likely to still be live on usenet servers.
+    Fallback chains are ordered by indexer priority then age ascending (youngest first).
+    Age is the primary proxy for usenet binary availability — a younger NZB is more
+    likely to still have live articles within provider retention windows. Different
+    indexers can carry the same release at different ages (original post vs re-post),
+    so age takes precedence over which indexer serves the NZB.
 
     Use arr_grab_release to execute each item in the returned plan.
 
@@ -259,26 +259,24 @@ async def arr_plan_grab(
         else:
             usenet_count += 1
 
-        # Build fallback list: other indexers first, then same-indexer duplicates last.
+        # Build fallback list sorted by: indexer priority, then age ascending.
         #
-        # Rationale: if a NZB returns NNTP 451 (article expired/missing), every other
-        # NZB for the same release on that same indexer will also return 451 — they all
-        # reference the same binary articles on the usenet server. Trying a different
-        # indexer's copy of the same release is the right first move.
+        # Age is the primary proxy for binary availability on usenet — a younger NZB
+        # is more likely to still have live articles within provider retention windows,
+        # regardless of which indexer serves it. Different indexers can carry NZBs at
+        # different ages for the same release (original post vs re-post), so a
+        # same-indexer NZB at a younger age may be a better bet than a different-indexer
+        # NZB at an older age.
         #
-        # Within each tier, sort by indexer priority then age ascending (youngest first),
-        # since newer binary articles are more likely to still be live.
-        other_indexer = sorted(
-            [r for r in candidates if r.get("guid") != chosen.get("guid") and r.get("indexer") != chosen.get("indexer")],
-            key=lambda r: (_indexer_rank(r), r.get("age", 999999)),
-        )
-        same_indexer_others = sorted(
-            [r for r in candidates if r.get("guid") != chosen.get("guid") and r.get("indexer") == chosen.get("indexer")],
-            key=lambda r: r.get("age", 999999),
-        )
+        # indexer_priority further biases selection when age is comparable, and lets
+        # callers encode empirical knowledge (e.g. a specific indexer consistently
+        # carries older content better than others).
         fallback_guids = [
             {"guid": r.get("guid"), "indexer_id": r.get("indexerId"), "indexer": r.get("indexer"), "title": r.get("title", "")}
-            for r in other_indexer + same_indexer_others
+            for r in sorted(
+                [r for r in candidates if r.get("guid") != chosen.get("guid")],
+                key=lambda r: (_indexer_rank(r), r.get("age", 999999)),
+            )
         ]
 
         plan.append({
