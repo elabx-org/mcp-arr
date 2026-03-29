@@ -391,12 +391,22 @@ async def arr_sync_trash_custom_formats(
         existing_cf = existing_by_name.get(cf_name.lower())
 
         # Build the payload (strip TRaSH-specific fields not in arr API)
+        # TRaSH stores spec fields as a dict {"value": ...} but Sonarr API
+        # expects a list [{"name": "value", "value": ...}].  Normalise here.
+        def _normalise_spec(spec: dict) -> dict:
+            fields = spec.get("fields", {})
+            if isinstance(fields, dict):
+                fields = [{"name": k, "value": v} for k, v in fields.items()]
+            return {**spec, "fields": fields}
+
         payload = {
             "name": cf_name,
             "includeCustomFormatWhenRenaming": trash_cf.get(
                 "includeCustomFormatWhenRenaming", False
             ),
-            "specifications": trash_cf.get("specifications", []),
+            "specifications": [
+                _normalise_spec(s) for s in trash_cf.get("specifications", [])
+            ],
         }
 
         if existing_cf is None:
