@@ -166,6 +166,7 @@ def main() -> None:
         language,
         releaseprofiles,
         releases as sonarr_releases,
+        season_audit,
         series,
         wanted as sonarr_wanted,
     )
