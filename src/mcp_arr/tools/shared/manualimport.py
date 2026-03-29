@@ -92,9 +92,30 @@ async def arr_force_import_download(
                      "Check that the download is complete and the ID is correct.",
         }
 
-    # Step 2: Issue the ManualImport command with replaceExistingFiles=True
+    # Step 2: Check rejections — skip any file blocked for sample-related reasons.
+    # We only want to bypass quality-upgrade rejections, not legitimate content warnings.
+    _SAMPLE_PHRASES = [
+        "sample",
+        "unable to determine if file is a sample",
+    ]
+
     import_files = []
+    skipped = []
+
     for f in files:
+        rejections = f.get("rejections", [])
+        sample_rejections = [
+            r.get("reason", "") for r in rejections
+            if any(phrase in r.get("reason", "").lower() for phrase in _SAMPLE_PHRASES)
+        ]
+        if sample_rejections:
+            skipped.append({
+                "path": f.get("path"),
+                "reason": "sample_rejection",
+                "rejection_messages": sample_rejections,
+            })
+            continue
+
         entry: dict = {
             "path": f.get("path"),
             "importMode": import_mode,
@@ -111,18 +132,29 @@ async def arr_force_import_download(
             entry["movieId"] = f["movieId"]
         import_files.append(entry)
 
-    command = {
-        "name": "ManualImport",
-        "files": import_files,
-        "importMode": import_mode,
-        "replaceExistingFiles": True,
-    }
-    result = await client.post("/api/v3/command", data=command)
+    if skipped and not import_files:
+        return {
+            "success": False,
+            "download_id": download_id,
+            "error": "All files blocked by sample rejection — not force importing.",
+            "skipped": skipped,
+        }
+
+    result = None
+    if import_files:
+        command = {
+            "name": "ManualImport",
+            "files": import_files,
+            "importMode": import_mode,
+            "replaceExistingFiles": True,
+        }
+        result = await client.post("/api/v3/command", data=command)
 
     return {
         "success": True,
         "download_id": download_id,
         "files_queued": len(import_files),
         "files": [f.get("path") for f in import_files],
+        "skipped_sample": skipped,
         "command": result,
     }
