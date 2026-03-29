@@ -64,12 +64,19 @@ async def arr_plan_grab(
     release_group: str | None = None,
     preferred_protocol: str = "usenet",
     spread_indexers: bool = True,
+    indexer_priority: list[str] | None = None,
 ) -> dict:
     """Plan an optimal grab strategy from search results. No API calls made — pure planning tool.
 
     Filters releases by release group (if specified), prefers the preferred protocol
     (usenet over torrent by default), and optionally distributes episode grabs
     round-robin across available indexers to balance load.
+
+    Fallback chains are ordered so that a different indexer is tried before another
+    copy from the same indexer — because if one NZB on an indexer returns NNTP 451
+    (article expired), all other NZBs for the same release on that indexer will too.
+    Within each indexer tier, releases are sorted youngest-first (smallest age value)
+    since newer binary articles are more likely to still be live on usenet servers.
 
     Use arr_grab_release to execute each item in the returned plan.
 
@@ -86,10 +93,25 @@ async def arr_plan_grab(
         spread_indexers: When True, distribute episode grab assignments round-robin
             across unique indexers to balance load. When False, use the best
             release per episode without indexer spreading.
+        indexer_priority: Optional ordered list of indexer name substrings to prefer
+            when selecting the primary and ordering fallbacks (case-insensitive).
+            E.g. ["nzb.life", "drunkenslug"] tries nzb.life copies before drunkenslug.
+            Indexers not in the list are ranked last but still used as fallbacks.
 
     Returns:
         Dict with "plan" list and "summary" statistics.
     """
+    # Build indexer rank function from priority list
+    priority_lower = [p.lower() for p in (indexer_priority or [])]
+
+    def _indexer_rank(r: dict) -> int:
+        """Lower is better. Unranked indexers get len(priority_lower)."""
+        name = (r.get("indexer") or "").lower()
+        for i, p in enumerate(priority_lower):
+            if p in name:
+                return i
+        return len(priority_lower)
+
     # Filter by release group if specified
     filtered = releases
     if release_group:
@@ -193,8 +215,14 @@ async def arr_plan_grab(
 
         covered += 1
 
+        # Sort preferred candidates: indexer priority first, then age ascending
+        # (younger NZBs are more likely to have live binary articles on usenet)
+        preferred_candidates.sort(key=lambda r: (_indexer_rank(r), r.get("age", 999999)))
+        fallback_candidates.sort(key=lambda r: (_indexer_rank(r), r.get("age", 999999)))
+
         if spread_indexers and len(all_indexers) > 1:
-            # Try to assign to the next indexer in round-robin order
+            # Try to assign to the next indexer in round-robin order,
+            # respecting indexer priority when multiple options exist
             chosen = None
             for attempt in range(len(all_indexers)):
                 target_indexer = all_indexers[(indexer_cycle_pos + attempt) % len(all_indexers)]
@@ -217,7 +245,7 @@ async def arr_plan_grab(
                     chosen = candidates[0]
                 indexer_cycle_pos = (indexer_cycle_pos + 1) % len(all_indexers)
         else:
-            # No spreading — just pick best by protocol preference
+            # No spreading — pick best by indexer priority, then age
             if preferred_candidates:
                 chosen = preferred_candidates[0]
             elif fallback_candidates:
@@ -231,6 +259,28 @@ async def arr_plan_grab(
         else:
             usenet_count += 1
 
+        # Build fallback list: other indexers first, then same-indexer duplicates last.
+        #
+        # Rationale: if a NZB returns NNTP 451 (article expired/missing), every other
+        # NZB for the same release on that same indexer will also return 451 — they all
+        # reference the same binary articles on the usenet server. Trying a different
+        # indexer's copy of the same release is the right first move.
+        #
+        # Within each tier, sort by indexer priority then age ascending (youngest first),
+        # since newer binary articles are more likely to still be live.
+        other_indexer = sorted(
+            [r for r in candidates if r.get("guid") != chosen.get("guid") and r.get("indexer") != chosen.get("indexer")],
+            key=lambda r: (_indexer_rank(r), r.get("age", 999999)),
+        )
+        same_indexer_others = sorted(
+            [r for r in candidates if r.get("guid") != chosen.get("guid") and r.get("indexer") == chosen.get("indexer")],
+            key=lambda r: r.get("age", 999999),
+        )
+        fallback_guids = [
+            {"guid": r.get("guid"), "indexer_id": r.get("indexerId"), "indexer": r.get("indexer"), "title": r.get("title", "")}
+            for r in other_indexer + same_indexer_others
+        ]
+
         plan.append({
             "episode_numbers": [ep_num],
             "full_season": False,
@@ -243,6 +293,7 @@ async def arr_plan_grab(
             "size": chosen.get("size", 0),
             "quality": (chosen.get("quality") or {}).get("quality", {}).get("name", ""),
             "warning": "torrent_fallback" if is_fallback else None,
+            "fallback_guids": fallback_guids,
         })
 
     return {
