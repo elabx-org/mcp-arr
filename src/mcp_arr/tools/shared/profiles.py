@@ -6,6 +6,105 @@ from ...server import get_client, mcp, resolve_instance
 
 
 # ---------------------------------------------------------------------------
+# High-level profile score helper
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def arr_update_quality_profile_scores(
+    scores: dict[str, int],
+    instance: str | None = None,
+    profile_ids: list[int] | None = None,
+) -> dict:
+    """Update custom format scores on quality profiles by CF name.
+
+    Fetches all custom formats from the instance, resolves names to IDs,
+    then applies the provided scores to the specified profiles (or all
+    profiles if profile_ids is omitted). All other CFs retain their
+    existing scores — only the CFs listed in scores are changed.
+
+    This is the high-level alternative to arr_update_quality_profile:
+    you provide human-readable CF names and scores, and the tool handles
+    ID lookups, full formatItems merging, and the PUT for each profile.
+
+    Args:
+        scores: Dict mapping CF name to score integer.
+            e.g. {"TrueHD ATMOS": 550, "BR-DISK": -999999, "LQ": -10000}
+            To zero out a CF, include it with score 0.
+        instance: Instance name (e.g., "sonarr", "radarr"). When None, uses the
+            first configured sonarr instance.
+        profile_ids: List of quality profile IDs to update. When None, updates
+            all profiles on the instance.
+
+    Returns:
+        Dict with updated/failed profile counts, unresolved CF names, and
+        per-profile results.
+    """
+    client = resolve_instance(instance, "sonarr")
+
+    # Resolve CF names → IDs
+    all_cfs = await client.get("/api/v3/customformat")
+    if not isinstance(all_cfs, list):
+        return {"error": "Failed to fetch custom formats"}
+
+    cf_by_name: dict[str, int] = {cf["name"]: cf["id"] for cf in all_cfs}
+    score_by_id: dict[int, int] = {}
+    unresolved: list[str] = []
+    for name, score in scores.items():
+        cf_id = cf_by_name.get(name)
+        if cf_id is not None:
+            score_by_id[cf_id] = score
+        else:
+            unresolved.append(name)
+
+    # Fetch profiles
+    all_profiles = await client.get("/api/v3/qualityprofile")
+    if not isinstance(all_profiles, list):
+        return {"error": "Failed to fetch quality profiles"}
+
+    targets = (
+        [p for p in all_profiles if p["id"] in profile_ids]
+        if profile_ids
+        else all_profiles
+    )
+
+    updated: list[dict] = []
+    failed: list[dict] = []
+
+    for profile in targets:
+        pid = profile["id"]
+        pname = profile["name"]
+
+        # Merge: start from existing formatItems, overlay new scores
+        existing_scores: dict[int, int] = {
+            fi["format"]: fi["score"]
+            for fi in profile.get("formatItems", [])
+        }
+        # Apply overrides
+        for cf_id, score in score_by_id.items():
+            existing_scores[cf_id] = score
+
+        # Rebuild full formatItems (all CFs must be present)
+        profile["formatItems"] = [
+            {"format": cf["id"], "score": existing_scores.get(cf["id"], 0)}
+            for cf in all_cfs
+        ]
+
+        result = await client.put(f"/api/v3/qualityprofile/{pid}", data=profile)
+        if result is not None:
+            updated.append({"id": pid, "name": pname})
+        else:
+            failed.append({"id": pid, "name": pname})
+
+    return {
+        "updated": updated,
+        "failed": failed,
+        "unresolved_cf_names": unresolved,
+        "scores_applied": len(score_by_id),
+        "profiles_updated": len(updated),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Quality Profiles
 # ---------------------------------------------------------------------------
 

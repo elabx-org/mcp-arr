@@ -4,6 +4,127 @@ from ...server import get_client, mcp, resolve_instance
 
 
 @mcp.tool()
+async def arr_get_stalled_downloads(
+    instance: str | None = None,
+    stall_threshold_minutes: int = 30,
+) -> dict:
+    """Find downloads that are stuck or stalled in the queue.
+
+    Fetches all queue items and classifies each as stalled based on its
+    trackedDownloadStatus, trackedDownloadState, and statusMessages.
+
+    Stall categories returned:
+    - warning: Sonarr/Radarr has flagged the item with a warning
+      (e.g. "no files found", "import blocked by existing file")
+    - error: Item is in an error state (download failed, unpack error, etc.)
+    - import_pending_long: Download completed but stuck in importPending
+      longer than stall_threshold_minutes (may need force import)
+    - stalled: Download client reports no peers/sources (torrent) or
+      the item has no estimated completion and zero download speed
+
+    Args:
+        instance: Instance name (e.g., "sonarr", "radarr"). When None, uses the
+            first configured instance regardless of type.
+        stall_threshold_minutes: How long (minutes) an importPending item must
+            sit before being flagged as stalled (default 30).
+
+    Returns:
+        Dict with categorised stalled items and a summary count per category.
+    """
+    import datetime
+
+    client = get_client(instance) if instance else resolve_instance(None, "sonarr")
+
+    # Fetch all pages
+    all_records: list[dict] = []
+    page = 1
+    while True:
+        result = await client.get(
+            "/api/v3/queue",
+            params={
+                "page": page,
+                "pageSize": 100,
+                "includeUnknownSeriesItems": True,
+            },
+        )
+        records = result.get("records", []) if isinstance(result, dict) else []
+        all_records.extend(records)
+        total = result.get("totalRecords", 0) if isinstance(result, dict) else 0
+        if len(all_records) >= total or not records:
+            break
+        page += 1
+
+    stalled: dict[str, list[dict]] = {
+        "warning": [],
+        "error": [],
+        "import_pending_long": [],
+        "stalled": [],
+    }
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    for item in all_records:
+        status = (item.get("trackedDownloadStatus") or "").lower()
+        state = (item.get("trackedDownloadState") or "").lower()
+        messages = item.get("statusMessages") or []
+        title = item.get("title", "")
+        item_id = item.get("id")
+        download_id = item.get("downloadId", "")
+
+        summary = {
+            "id": item_id,
+            "title": title,
+            "download_id": download_id,
+            "status": status,
+            "state": state,
+            "protocol": item.get("protocol", ""),
+            "indexer": item.get("indexer", ""),
+            "messages": [
+                msg.get("title", "") + ": " + ", ".join(msg.get("messages", []))
+                for msg in messages
+                if msg.get("title") or msg.get("messages")
+            ],
+        }
+
+        if status == "warning":
+            stalled["warning"].append(summary)
+        elif status == "error":
+            stalled["error"].append(summary)
+        elif state == "importpending":
+            # Check how long it's been sitting in importPending
+            added_str = item.get("added") or item.get("estimatedCompletionTime")
+            flagged = False
+            if added_str:
+                try:
+                    added = datetime.datetime.fromisoformat(
+                        added_str.replace("Z", "+00:00")
+                    )
+                    minutes_waiting = (now - added).total_seconds() / 60
+                    if minutes_waiting > stall_threshold_minutes:
+                        summary["minutes_in_import_pending"] = round(minutes_waiting)
+                        stalled["import_pending_long"].append(summary)
+                        flagged = True
+                except ValueError:
+                    pass
+            if not flagged and messages:
+                stalled["import_pending_long"].append(summary)
+        elif state in ("downloading", "queued"):
+            # Stalled if no speed and no ETA (torrent: no peers)
+            sizeleft = item.get("sizeleft", -1)
+            timeleft = item.get("timeleft")  # "HH:MM:SS" or null
+            if sizeleft == 0:
+                continue  # completed, not stalled
+            if timeleft is None and sizeleft > 0:
+                stalled["stalled"].append(summary)
+
+    return {
+        "summary": {cat: len(items) for cat, items in stalled.items()},
+        "total_stalled": sum(len(v) for v in stalled.values()),
+        "items": stalled,
+    }
+
+
+@mcp.tool()
 async def arr_get_queue(
     instance: str | None = None,
     page: int = 1,
